@@ -14,6 +14,7 @@ use nydus_error::{Context, Error, Result};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
 use serde::Deserialize;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -132,6 +133,8 @@ pub struct LocalConfig {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+// Preserve the beta.2 public enum shape when adding optional credentials.
+#[allow(clippy::large_enum_variant)]
 pub enum BackendConfig {
     /// Serve blobs from a local directory.
     Local(LocalConfig),
@@ -155,7 +158,7 @@ impl BackendConfig {
 
 /// The registry backend configuration, serving blobs from an OCI image
 /// registry.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryConfig {
     /// The registry address including the scheme, e.g.
@@ -171,6 +174,11 @@ pub struct RegistryConfig {
     #[serde(default)]
     pub auth: Option<String>,
 
+    /// An optional bearer token to use until the registry rejects it. Keep
+    /// `auth` to obtain a replacement when this externally supplied token expires.
+    #[serde(default)]
+    pub registry_token: Option<String>,
+
     /// The HTTP client configuration: timeouts, retries, and TLS trust. The
     /// timeout also applies to Dragonfly SDK requests; retry counts for
     /// Dragonfly reads are governed by the `dragonfly` policy knobs instead.
@@ -185,6 +193,22 @@ pub struct RegistryConfig {
     /// ignoring it.
     #[serde(default)]
     pub dragonfly: Option<DragonflyConfig>,
+}
+
+impl fmt::Debug for RegistryConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegistryConfig")
+            .field("addr", &self.addr)
+            .field("repository", &self.repository)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .field(
+                "registry_token",
+                &self.registry_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("http", &self.http)
+            .field("dragonfly", &self.dragonfly)
+            .finish()
+    }
 }
 
 /// The HTTP client configuration for the registry backend.

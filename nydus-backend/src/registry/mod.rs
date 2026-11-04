@@ -440,11 +440,13 @@ impl Response {
 /// that are invalid in an HTTP header (e.g. newlines) must surface as an auth
 /// error instead of a panic.
 fn auth_header_value(value: &str) -> RegistryResult<reqwest::header::HeaderValue> {
-    value.parse().map_err(|_| {
+    let mut header: reqwest::header::HeaderValue = value.parse().map_err(|_| {
         RegistryError::Unauthorized(
             "credentials contain bytes that are invalid in an HTTP header".to_string(),
         )
-    })
+    })?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 /// Authentication challenge parsed from a `www-authenticate` header.
@@ -597,6 +599,18 @@ impl Registry {
             nydus_telemetry::metrics::BackendTarget::Origin
         };
 
+        let cached_auth = match config.registry_token.as_deref() {
+            Some(token) => {
+                if token.trim().is_empty() {
+                    return Err(io::Error::other("registry bearer token is empty"));
+                }
+                let value = format!("Bearer {token}");
+                auth_header_value(&value).map_err(io::Error::other)?;
+                value
+            }
+            None => String::new(),
+        };
+
         Ok(Registry {
             scheme,
             host,
@@ -605,7 +619,7 @@ impl Registry {
             // `username:password` string sent verbatim after the `Basic `
             // scheme prefix.
             basic_auth: config.auth,
-            cached_auth: RwLock::new(String::new()),
+            cached_auth: RwLock::new(cached_auth),
             token_expires_at: ArcSwapOption::from(None),
             redirect_urls: RwLock::new(HashMap::new()),
             http,
@@ -1147,6 +1161,12 @@ impl Registry {
 
         // Drop any stale token so the server returns the expected challenge.
         let challenge_response = if headers.remove(AUTHORIZATION).is_some() {
+            let mut current = self.cached_auth.write().unwrap();
+            if *current == cached_auth {
+                current.clear();
+                self.token_expires_at.store(None);
+            }
+            drop(current);
             self.request(method.clone(), url, headers.clone(), context, true)?
         } else {
             response
@@ -1461,6 +1481,23 @@ dragonfly:
             .expect("dragonfly endpoint must be rejected without the feature");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("backend-dragonfly-proxy"));
+    }
+
+    #[test]
+    fn configured_bearer_token_is_validated_and_preserves_renewal_credentials() {
+        let config: RegistryConfig = serde_yaml::from_str("addr: https://registry.example.com\nrepository: library/ubuntu\nauth: YWxpY2U6c2VjcmV0\nregistry_token: provided\n").unwrap();
+        let registry = Registry::new(config).unwrap();
+        assert_eq!(registry.current_auth(), "Bearer provided");
+        assert!(registry.token_expires_at.load().is_none());
+        assert_eq!(registry.basic_auth.as_deref(), Some("YWxpY2U6c2VjcmV0"));
+        assert!(auth_header_value(&registry.current_auth())
+            .unwrap()
+            .is_sensitive());
+        for value in ["", " ", "secret\nvalue"] {
+            let config: RegistryConfig = serde_yaml::from_str(&format!("addr: https://registry.example.com\nrepository: library/ubuntu\nregistry_token: {value:?}\n")).unwrap();
+            let error = Registry::new(config).err().unwrap();
+            assert!(!error.to_string().contains("secret"));
+        }
     }
 
     #[test]
